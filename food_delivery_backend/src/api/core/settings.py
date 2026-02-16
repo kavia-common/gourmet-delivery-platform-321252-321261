@@ -26,13 +26,17 @@ class Settings(BaseModel):
     # PostgreSQL (provided by the database container)
     postgres_url: str | None = Field(
         default=os.getenv("POSTGRES_URL"),
-        description="SQLAlchemy-style PostgreSQL URL. If omitted, constructed from POSTGRES_* parts.",
+        description="SQLAlchemy-style PostgreSQL URL. If omitted, can be read from DB_CONNECTION_FILE or constructed from POSTGRES_* parts.",
     )
     postgres_user: str | None = Field(default=os.getenv("POSTGRES_USER"), description="PostgreSQL username")
     postgres_password: str | None = Field(default=os.getenv("POSTGRES_PASSWORD"), description="PostgreSQL password")
     postgres_db: str | None = Field(default=os.getenv("POSTGRES_DB"), description="PostgreSQL database name")
     postgres_port: str | None = Field(default=os.getenv("POSTGRES_PORT"), description="PostgreSQL port")
     postgres_host: str = Field(default=os.getenv("POSTGRES_HOST", "localhost"), description="PostgreSQL hostname")
+    db_connection_file: str = Field(
+        default=os.getenv("DB_CONNECTION_FILE", "db_connection.txt"),
+        description="Path to db_connection.txt file (first token containing postgresql URL will be used).",
+    )
 
     # Auth
     jwt_secret: str | None = Field(
@@ -49,15 +53,56 @@ class Settings(BaseModel):
     site_url: str | None = Field(default=os.getenv("SITE_URL"), description="Frontend base URL")
     ws_url: str | None = Field(default=os.getenv("WS_URL"), description="WebSocket URL")
 
+    def _normalize_sqlalchemy_url(self, url: str) -> str:
+        """
+        Ensure the SQLAlchemy URL uses the psycopg driver.
+        Accepts either postgresql:// or postgresql+psycopg:// and returns postgresql+psycopg://...
+        """
+        if url.startswith("postgresql+psycopg://"):
+            return url
+        if url.startswith("postgresql://"):
+            return "postgresql+psycopg://" + url[len("postgresql://") :]
+        # Leave other schemes untouched (in case of future adapters)
+        return url
+
+    def _read_db_url_from_file(self) -> str | None:
+        """
+        Try to read a PostgreSQL URL from db_connection.txt-formatted file.
+        Expected content example (first token used):
+            psql postgresql://user:pass@host:port/db
+        """
+        path = self.db_connection_file
+        try:
+            if not os.path.exists(path):
+                return None
+            with open(path, "r") as f:
+                content = f.read().strip()
+            # Split by whitespace and newlines to find a token that looks like a postgresql URL
+            for token in content.replace("\n", " ").split():
+                if token.startswith("postgresql://") or token.startswith("postgresql+psycopg://"):
+                    return self._normalize_sqlalchemy_url(token)
+        except Exception:
+            # Silent fallback - callers will handle raising if nothing configured
+            return None
+        return None
+
+    # PUBLIC_INTERFACE
     def build_database_url(self) -> str:
-        """Build database URL from parts if POSTGRES_URL isn't set."""
+        """Build database URL from POSTGRES_URL, DB_CONNECTION_FILE, or parts (POSTGRES_*)."""
         if self.postgres_url:
-            return self.postgres_url
+            return self._normalize_sqlalchemy_url(self.postgres_url)
+
+        # Try db_connection.txt pattern
+        file_url = self._read_db_url_from_file()
+        if file_url:
+            return file_url
 
         # Fallback to parts. Note: these are expected to be set by the orchestrator.
         if not (self.postgres_user and self.postgres_password and self.postgres_db and self.postgres_port):
             raise RuntimeError(
-                "Database configuration missing. Set POSTGRES_URL or POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB/POSTGRES_PORT."
+                "Database configuration missing. Provide one of: "
+                "POSTGRES_URL, DB_CONNECTION_FILE pointing to db_connection.txt, "
+                "or POSTGRES_USER/POSTGRES_PASSWORD/POSTGRES_DB/POSTGRES_PORT."
             )
 
         return f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
